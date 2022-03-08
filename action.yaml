@@ -1,0 +1,91 @@
+---
+name: 'Build and Push Helm Chart'
+
+description: 'Build and push a helm chart if any files in its directory have changed.'
+
+inputs:
+  chart-directory:
+    description: 'Password for provided user to authenticate with the specified Helm repository'
+    required: true
+  password:
+    description: 'Password for provided user to authenticate with the specified Helm repository'
+    required: true
+  repo-name:
+    default: 'harbor'
+    description: 'Name of the Helm repository to publish the chart to'
+    required: false
+  repo-url:
+    default: 'https://harbor.infra.updatron.com/chartrepo/updater'
+    description: 'URL of the Helm repository to publish the chart to'
+    required: false
+  username:
+    description: 'Username of user to authenticate with the specified Helm repository'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: cache helm
+      uses: actions/cache@v2
+      with:
+        path: |
+          /usr/local/bin/helm
+        key: helm-${{ runner.os }}-${{ hashFiles('/usr/local/bin/helm') }}
+        restore-keys: |
+          helm-${{ runner.os }}
+
+    - name: install helm
+      shell: bash
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+    - name: get helm plugins directory
+      id: helm-plugins-dir
+      shell: bash
+      run: |
+        echo "::set-output name=dir::$(helm env | grep HELM_PLUGINS | cut -d'=' -f2 | tr -d '\"')"
+
+    - name: cache helm plugins
+      id: cache-helm
+      uses: actions/cache@v2
+      with:
+        path: ${{ steps.helm-plugins-dir.outputs.dir }}
+        key: helm-plugins-${{ runner.os }}-${{ hashFiles(steps.helm-plugins-dir.outputs.dir) }}
+        restore-keys: |
+          helm-plugins-${{ runner.os }}
+
+    - name: install or update cm-push helm plugin
+      if: steps.cache-helm.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        if grep -q cm-push <(helm plugin list); then
+          helm plugin update cm-push
+        else
+          helm plugin install https://github.com/chartmuseum/helm-push
+        fi
+
+    - name: log into the helm repo
+      shell: bash
+      run: |
+        helm repo add --username='${{ inputs.username }}' --password='${{ inputs.password }}' ${{ inputs.repo-name }} ${{ inputs.repo-url }}
+
+    - name: build and push chart
+      shell: bash
+      run: |
+        BRANCH_REF=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+        FORMATTED_BRANCH_REF=$(echo $BRANCH_REF | sed 's/[^a-zA-Z0-9]/-/g')
+        CURRENT_CHART_VERSION=`yq e '.version' Chart.yaml`
+        LATEST_CHART_VERSION=`helm search repo ${{ inputs.repo-name }}/${CHART} | awk 'FNR==2{print $2}'`
+        helm dependency update .
+        # If no published chart version or if the current committed major version is higher, then use the committed version
+        function version_gt() { test "$(echo "$@" | tr " " "\n" | sort -V | head -n 1)" != "$1"; }
+        if [ -z ${LATEST_CHART_VERSION} ] || version_gt ${CURRENT_CHART_VERSION} ${LATEST_CHART_VERSION}; then
+          NEW_CHART_VERSION=${CURRENT_CHART_VERSION}
+        else
+          NEW_CHART_VERSION=`echo "${LATEST_CHART_VERSION}" | awk -F. '{$NF = $NF + 1;} 1' | sed 's/ /./g'`
+        fi
+        if [ ${{ github.ref_name }} != "main" ]; then
+          NEW_CHART_VERSION=${NEW_CHART_VERSION}-${FORMATTED_BRANCH_REF}.${{ github.run_number }}
+        fi
+        helm cm-push . --version ${NEW_CHART_VERSION} ${{ inputs.repo-name }}
+      working-directory: ${{ inputs.chart-directory }}
